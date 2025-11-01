@@ -39,9 +39,12 @@ if before != after:
     print(f"Dropped {before - after} rows with NaN values")
 
 # ---------- prepare features ----------
-feature_cols = ["S", "qc", "fs", "u2", "Effective Stress", "Fr", "Qt", "Depth"]
+if "S" in test_df.columns:
+    test_df["S_Prop_num"] = pd.to_numeric(test_df["S"], errors="coerce")
 
-poly = PolynomialFeatures(degree=2, include_bias=False)
+feature_cols = ["S_Prop_num", "qc", "fs", "u2", "Effective Stress", "Fr", "Qt", "Depth"]
+
+poly = PolynomialFeatures(degree=2, include_bias=False, interaction_only=True)
 scaler = RobustScaler()
 
 # Note: The polynomial & scaler should be *fitted on the same structure* as during training.
