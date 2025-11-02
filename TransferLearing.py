@@ -1,165 +1,87 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
+import pandas as pd
 import numpy as np
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import joblib
 import os
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from tabpfn import TabPFNRegressor
+import joblib
 
-# ==============================================
-# CONFIGURATION
-# ==============================================
-MODEL_DIR = "./models_phi_C_bootstrap"
-LABELED_DATA_PATH = "NewDF - Sheet1.csv"  # replace with your real labeled dataset path
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# ---------------------------------------------------------
+# 1. Load and prepare data
+# ---------------------------------------------------------
+DATA_PATH = "NewDF - Sheet1.csv"  # ← change this to your CSV file
+df = pd.read_csv(DATA_PATH)
 
-LR_BASE = 1e-3          # learning rate for heads
-LR_FEATURES = 1e-5      # learning rate for frozen layers (if unfreezing later)
-WEIGHT_DECAY = 1e-4     # L2 regularization
-EPOCHS = 300
-BATCH_SIZE = 16
-PATIENCE = 20            # early stopping patience
-FREEZE_EPOCHS = 50       # unfreeze after this many epochs
+# Drop irrelevant or empty columns
+df = df.dropna(axis=1, how="all")
 
-# ==============================================
-# DATA PREPARATION
-# ==============================================
-data = np.loadtxt(LABELED_DATA_PATH, delimiter=",", skiprows=1)
-X = data[:, :-2]
-y_C = data[:, -2]
-y_phi = data[:, -1]
-y = np.stack([y_C, y_phi], axis=1)
+# Ensure phi exists
+if "phi" not in df.columns:
+    raise ValueError("❌ 'phi' column not found in dataset.")
 
-X = torch.tensor(X, dtype=torch.float32)
-y = torch.tensor(y, dtype=torch.float32)
+# Define target and features
+target_col = "phi"
+exclude_cols = ["C", "phi", "S Propesed"]  # drop other labels if present
+feature_cols = [c for c in df.columns if c not in exclude_cols]
 
-n_samples = len(X)
-n_train = int(0.8 * n_samples)
-n_hold = n_samples - n_train
+df = df.dropna(subset=[target_col])  # keep rows where phi exists
+X = df[feature_cols].fillna(df.median())
+y = df[target_col].values
 
-train_ds, hold_ds = random_split(TensorDataset(X, y), [n_train, n_hold])
-train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-hold_dl = DataLoader(hold_ds, batch_size=BATCH_SIZE)
+# ---------------------------------------------------------
+# 2. Train/test split (few-shot)
+# ---------------------------------------------------------
+X_train, X_hold, y_train, y_hold = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+print(f"Labeled rows: {len(X)}, Train: {len(X_train)}, Holdout: {len(X_hold)}")
 
-print(f"Labeled rows: {n_samples}. Train: {n_train}, Holdout: {n_hold}")
+# ---------------------------------------------------------
+# 3. Standardize features
+# ---------------------------------------------------------
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_hold_scaled = scaler.transform(X_hold)
 
-# ==============================================
-# MODEL DEFINITION
-# ==============================================
-class FewShotModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim=64):
-        super().__init__()
-        # Shared feature extractor (pretrained backbone)
-        self.features = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
-        # Separate heads for C and phi
-        self.C_head = nn.Linear(hidden_dim, 1)
-        self.phi_head = nn.Linear(hidden_dim, 1)
+# ---------------------------------------------------------
+# 4. Train TabPFN for phi
+# ---------------------------------------------------------
+print("\n=== Training TabPFN model for φ (phi) ===")
 
-    def forward(self, x):
-        feats = self.features(x)
-        C_pred = self.C_head(feats)
-        phi_pred = self.phi_head(feats)
-        return torch.cat([C_pred, phi_pred], dim=1)
+model = TabPFNRegressor(device="cpu")  # use device="cuda" if you have a GPU
+model.fit(X_train_scaled, y_train)
 
-# ==============================================
-# LOAD PRETRAINED WEIGHTS (optional)
-# ==============================================
-# if you have a pretrained model saved:
-pretrained_path = os.path.join(MODEL_DIR, "fewshot_pretrained.pt")
-model = FewShotModel(input_dim=X.shape[1]).to(DEVICE)
-if os.path.exists(pretrained_path):
-    print(f"Loading pretrained model from {pretrained_path}")
-    model.load_state_dict(torch.load(pretrained_path, map_location=DEVICE))
+# ---------------------------------------------------------
+# 5. Evaluate on holdout
+# ---------------------------------------------------------
+y_pred = model.predict(X_hold_scaled)
 
-# ==============================================
-# TRAINING LOOP
-# ==============================================
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=LR_BASE, weight_decay=WEIGHT_DECAY)
-best_loss = float("inf")
-patience_counter = 0
+mae = mean_absolute_error(y_hold, y_pred)
+rmse = np.sqrt(mean_squared_error(y_hold, y_pred))
+r2 = r2_score(y_hold, y_pred)
 
-# Freeze feature extractor initially
-for param in model.features.parameters():
-    param.requires_grad = False
+print(f"\n📊 φ (phi) Holdout Performance:")
+print(f" MAE = {mae:.4f}")
+print(f" RMSE = {rmse:.4f}")
+print(f" R² = {r2:.4f}")
 
-for epoch in range(EPOCHS):
-    model.train()
-    train_loss = 0
-    for xb, yb in train_dl:
-        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-        optimizer.zero_grad()
-        pred = model(xb)
-        loss = criterion(pred, yb)
-        loss.backward()
-        optimizer.step()
-        train_loss += loss.item() * xb.size(0)
+# ---------------------------------------------------------
+# 6. Save model and scaler
+# ---------------------------------------------------------
+os.makedirs("./models_tabpfn_phi", exist_ok=True)
+joblib.dump(model, "./models_tabpfn_phi/phi_TabPFN.joblib")
+joblib.dump(scaler, "./models_tabpfn_phi/scaler.joblib")
 
-    train_loss /= len(train_dl.dataset)
+print("\n✅ Model and scaler saved to './models_tabpfn_phi'")
 
-    # Holdout evaluation
-    model.eval()
-    preds, truths = [], []
-    with torch.no_grad():
-        for xb, yb in hold_dl:
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            pred = model(xb)
-            preds.append(pred.cpu().numpy())
-            truths.append(yb.cpu().numpy())
+# ---------------------------------------------------------
+# 7. Example predictions
+# ---------------------------------------------------------
+print("\n🔮 Example φ predictions:")
+example = X_hold.iloc[:5]
+example_scaled = scaler.transform(example)
+example_preds = model.predict(example_scaled)
 
-    y_pred_hold = np.concatenate(preds)
-    y_hold = np.concatenate(truths)
-    hold_loss = mean_squared_error(y_hold, y_pred_hold)
-
-    print(f"Epoch {epoch+1:03d}/{EPOCHS} | Train Loss: {train_loss:.4f} | Holdout MSE: {hold_loss:.4f}")
-
-    # Unfreeze gradually
-    if epoch == FREEZE_EPOCHS:
-        print("Unfreezing feature extractor for fine-tuning...")
-        for param in model.features.parameters():
-            param.requires_grad = True
-        optimizer = optim.Adam([
-            {"params": model.features.parameters(), "lr": LR_FEATURES},
-            {"params": model.C_head.parameters()},
-            {"params": model.phi_head.parameters()},
-        ], lr=LR_BASE, weight_decay=WEIGHT_DECAY)
-
-    # Early stopping
-    if hold_loss < best_loss:
-        best_loss = hold_loss
-        patience_counter = 0
-        torch.save(model.state_dict(), os.path.join(MODEL_DIR, "fewshot_best.pt"))
-    else:
-        patience_counter += 1
-        if patience_counter >= PATIENCE:
-            print("Early stopping triggered.")
-            break
-
-# ==============================================
-# FINAL EVALUATION
-# ==============================================
-model.load_state_dict(torch.load(os.path.join(MODEL_DIR, "fewshot_best.pt")))
-model.eval()
-y_pred_hold = []
-y_hold = []
-with torch.no_grad():
-    for xb, yb in hold_dl:
-        pred = model(xb.to(DEVICE))
-        y_pred_hold.append(pred.cpu().numpy())
-        y_hold.append(yb.numpy())
-y_pred_hold = np.concatenate(y_pred_hold)
-y_hold = np.concatenate(y_hold)
-
-for i, name in enumerate(["C", "phi"]):
-    mae = mean_absolute_error(y_hold[:, i], y_pred_hold[:, i])
-    rmse = mean_squared_error(y_hold[:, i], y_pred_hold[:, i])
-    r2 = r2_score(y_hold[:, i], y_pred_hold[:, i])
-    print(f"Holdout {name}: MAE={mae:.4f}, RMSE={rmse:.4f}, R2={r2:.4f}")
-
-print("✅ Training complete. Best model saved to fewshot_best.pt")
+for i, val in enumerate(example_preds):
+    print(f" Sample {i+1}: predicted φ = {val:.3f}")
